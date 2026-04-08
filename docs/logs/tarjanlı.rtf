@@ -1,0 +1,1624 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fnil\fcharset0 HelveticaNeue-Bold;\f1\fnil\fcharset0 HelveticaNeue;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww29200\viewh15480\viewkind0
+\deftab560
+\pard\pardeftab560\partightenfactor0
+
+\f0\b\fs40 \cf0 tarjanl\uc0\u305 \
+\pard\pardeftab560\slleading20\partightenfactor0
+
+\f1\b0\fs26 \cf0 import java.io.BufferedReader;\
+import java.io.BufferedWriter;\
+import java.io.FileReader;\
+import java.io.FileWriter;\
+import java.io.IOException;\
+\
+public class Main \{\
+    public static void main(String[] args) throws Exception \{\
+        if (args.length < 2) \{\
+            return;\
+        \}\
+        MatrixNet matrixNet = new MatrixNet();\
+        try (BufferedReader reader = new BufferedReader(new FileReader(args[0]), 32768);\
+                BufferedWriter writer = new BufferedWriter(new FileWriter(args[1]), 32768)) \{\
+            String line;\
+            while ((line = reader.readLine()) != null) \{\
+                line = line.trim();\
+                if (line.isEmpty()) \{\
+                    continue;\
+                \}\
+                matrixNet.process(line, writer);\
+            \}\
+        \}\
+    \}\
+\
+    // Core simulation engine for MatrixNet\
+    private static class MatrixNet \{\
+        private static final int MAX_HOSTS_INIT = 10000;\
+        // Host data using parallel arrays for cache efficiency\
+        private String[] hostIds = new String[MAX_HOSTS_INIT];\
+        private int[] hostClearance = new int[MAX_HOSTS_INIT];\
+        private int hostCount = 0;\
+        // Custom Hash Map for Host ID (String) -> Index (int)\
+        // Uses separate chaining for collision resolution.\
+        private final HostMap hostMap = new HostMap();\
+\
+        private static final int MAX_EDGES_INIT = 50000;\
+        // Adjacency list (Linked Forward Star representation)\
+        // head[u] points to the first edge index for host u\
+        private int[] head;\
+        // next[e] points to the next edge index in the list\
+        private int[] next = new int[MAX_EDGES_INIT];\
+        private int[] to = new int[MAX_EDGES_INIT];\
+        private int[] latency = new int[MAX_EDGES_INIT];\
+        private int[] bandwidth = new int[MAX_EDGES_INIT];\
+        private int[] firewall = new int[MAX_EDGES_INIT];\
+        private boolean[] sealed = new boolean[MAX_EDGES_INIT];\
+        private int edgeCount = 0;\
+\
+        // Maps edge e to its reverse edge partner\
+        private int[] edgePartner = new int[MAX_EDGES_INIT];\
+\
+        // Lookup for existing connections between u and v\
+        private final ConnectionMap connectionMap = new ConnectionMap();\
+\
+        private long totalClearance = 0;\
+        private long unsealedBandwidthSum = 0;\
+        private int unsealedBackdoorCount = 0;\
+\
+        private static final int INITIAL_HOST_CAP = 100000;\
+        private static final int INITIAL_EDGE_CAP = 500000;\
+\
+        private boolean graphInfoDirty = true;\
+        private GraphInfo cachedGraphInfo = new GraphInfo();\
+\
+        // Tarjan's Algorithm structures for Articulation Points & Bridges\
+        private int[] disc; // Discovery time\
+        private int[] low; // Low-link value\
+        private int[] tarjanStack; // Stack for iterative DFS\
+        private int time;\
+        private int[] apComponentIncrease; // How many *additional* components if node u is removed\
+        private boolean[] isBridge; // Marks if edge e is a bridge\
+        private boolean criticalitiesDirty = true;\
+        private int[] childCount; // Children in DFS tree (for root check)\
+\
+        // Token-based clearing for Tarjan\
+        private int[] visitedToken;\
+        private int globalToken = 0;\
+\
+        // Dijkstra structures (Pareto frontier states)\
+        private int[] bestHead;\
+        private int[] bestRunId;\
+        private BestStatePool bestPool;\
+        private int routeSearchId = 0;\
+\
+        // BFS and pooling structures for graph traversal\
+        private final StringBuilder logBuffer = new StringBuilder(1024);\
+\
+        private final PrimitiveRouteStateHeap pq = new PrimitiveRouteStateHeap();\
+        private final LineParser parser = new LineParser();\
+\
+        MatrixNet() \{\
+            head = new int[INITIAL_HOST_CAP];\
+            for (int i = 0; i < head.length; i++)\
+                head[i] = -1;\
+            hostIds = new String[INITIAL_HOST_CAP];\
+            hostClearance = new int[INITIAL_HOST_CAP];\
+            // edges will be init via ensureEdgeCapacity or explicit alloc loop?\
+            // Better to modify ensureEdgeCapacity to respect INITIAL or init fields here.\
+            // But fields are separate.\
+            // Let's rely on capacity check but set MAX_HOSTS_INIT to large value.\
+            // Actually I defined INITIAL_HOST_CAP above.\
+        \}\
+\
+        // Host ranking for lexicographical tie-breaking\
+        private int[] hostRank;\
+        private boolean hostsDirtyRanks = true;\
+\
+        void process(String line, BufferedWriter writer) throws IOException \{\
+            parser.reset(line);\
+\
+            // Zero-Allocation Command Dispatch\
+            if (parser.isCommand("spawn_host")) \{\
+                handleSpawnHost(writer);\
+            \} else if (parser.isCommand("link_backdoor")) \{\
+                handleLinkBackdoor(writer);\
+            \} else if (parser.isCommand("seal_backdoor")) \{\
+                handleSealBackdoor(writer);\
+            \} else if (parser.isCommand("trace_route")) \{\
+                handleTraceRoute(writer);\
+            \} else if (parser.isCommand("scan_connectivity")) \{\
+                handleScanConnectivity(writer);\
+            \} else if (parser.isCommand("simulate_breach")) \{\
+                handleSimulateBreach(writer);\
+            \} else if (parser.isCommand("oracle_report")) \{\
+                handleOracleReport(writer);\
+            \}\
+        \}\
+\
+        private void handleSpawnHost(BufferedWriter writer) throws IOException \{\
+            String id = parser.nextString();\
+            int clearance = parser.nextInt();\
+\
+            if (!isValidHostId(id) || hostMap.contains(id)) \{\
+                writer.write("Some error occurred in spawn_host.");\
+                writer.newLine();\
+                return;\
+            \}\
+            ensureHostCapacity(hostCount + 1);\
+            int u = hostCount++;\
+            hostIds[u] = id;\
+            hostClearance[u] = clearance;\
+            hostMap.put(id, u);\
+            head[u] = -1; // Initialize edge list as empty\
+\
+            totalClearance += clearance;\
+            // Mark graph properties as dirty since node count changed\
+            markGraphDirty();\
+            hostsDirtyRanks = true; // Trigger re-ranking\
+            logBuffer.setLength(0);\
+            logBuffer.append("Spawned host ").append(id).append(" with clearance level ").append(clearance).append(".");\
+            writer.append(logBuffer);\
+            writer.newLine();\
+        \}\
+\
+        private void handleLinkBackdoor(BufferedWriter writer) throws IOException \{\
+            if (!parser.nextToken()) \{\
+                writer.write("Some error occurred in link_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int u = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+            if (!parser.nextToken()) \{\
+                writer.write("Some error occurred in link_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int v = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+\
+            if (u == -1 || v == -1 || u == v) \{\
+                writer.write("Some error occurred in link_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            long key = connectionKey(u, v);\
+            if (connectionMap.contains(key)) \{\
+                writer.write("Some error occurred in link_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int lat = parser.nextInt();\
+            int bw = parser.nextInt();\
+            int fw = parser.nextInt();\
+\
+            addEdge(u, v, lat, bw, fw);\
+\
+            unsealedBackdoorCount++;\
+            unsealedBandwidthSum += bw;\
+            markGraphDirty(); // Connectivity might change\
+            logBuffer.setLength(0);\
+            logBuffer.append("Linked ").append(hostIds[u]).append(" <-> ").append(hostIds[v])\
+                    .append(" with latency ").append(lat).append("ms, bandwidth ").append(bw)\
+                    .append("Mbps, firewall ").append(fw).append(".");\
+            writer.append(logBuffer);\
+            writer.newLine();\
+        \}\
+\
+        private void addEdge(int u, int v, int lat, int bw, int fw) \{\
+            ensureEdgeCapacity(edgeCount + 2);\
+\
+            int e1 = edgeCount++;\
+            to[e1] = v;\
+            latency[e1] = lat;\
+            bandwidth[e1] = bw;\
+            firewall[e1] = fw;\
+            sealed[e1] = false;\
+            next[e1] = head[u];\
+            head[u] = e1;\
+\
+            int e2 = edgeCount++;\
+            to[e2] = u;\
+            latency[e2] = lat;\
+            bandwidth[e2] = bw;\
+            firewall[e2] = fw;\
+            sealed[e2] = false;\
+            next[e2] = head[v];\
+            head[v] = e2;\
+\
+            edgePartner[e1] = e2;\
+            edgePartner[e2] = e1;\
+\
+            connectionMap.put(connectionKey(u, v), e1);\
+        \}\
+\
+        private void handleSealBackdoor(BufferedWriter writer) throws IOException \{\
+            if (!parser.nextToken()) \{\
+                writer.write("Some error occurred in seal_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int u = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+            if (!parser.nextToken()) \{\
+                writer.write("Some error occurred in seal_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int v = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+\
+            if (u == -1 || v == -1) \{\
+                writer.write("Some error occurred in seal_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            long key = connectionKey(u, v);\
+            int e1 = connectionMap.get(key);\
+            if (e1 == -1) \{\
+                writer.write("Some error occurred in seal_backdoor.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int e2 = edgePartner[e1];\
+\
+            if (sealed[e1]) \{\
+                sealed[e1] = false;\
+                sealed[e2] = false;\
+                unsealedBackdoorCount++;\
+                unsealedBandwidthSum += bandwidth[e1];\
+                logBuffer.setLength(0);\
+                logBuffer.append("Backdoor ").append(hostIds[u]).append(" <-> ").append(hostIds[v])\
+                        .append(" unsealed.");\
+                writer.append(logBuffer);\
+            \} else \{\
+                sealed[e1] = true;\
+                sealed[e2] = true;\
+                unsealedBackdoorCount--;\
+                unsealedBandwidthSum -= bandwidth[e1];\
+                logBuffer.setLength(0);\
+                logBuffer.append("Backdoor ").append(hostIds[u]).append(" <-> ").append(hostIds[v]).append(" sealed.");\
+                writer.append(logBuffer);\
+            \}\
+            writer.newLine();\
+            markGraphDirty();\
+        \}\
+\
+        private void handleTraceRoute(BufferedWriter writer) throws IOException \{\
+            if (!parser.nextToken()) \{\
+                writer.write("Some error occurred in trace_route.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int source = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+            if (!parser.nextToken()) \{\
+                writer.write("Some error occurred in trace_route.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int dest = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+\
+            if (source == -1 || dest == -1) \{\
+                writer.write("Some error occurred in trace_route.");\
+                writer.newLine();\
+                return;\
+            \}\
+            if (source == dest) \{\
+                logBuffer.setLength(0);\
+                logBuffer.append("Optimal route ").append(hostIds[source]).append(" -> ").append(hostIds[dest])\
+                        .append(": ").append(hostIds[source]).append(" (Latency = 0ms)");\
+                writer.append(logBuffer);\
+                writer.newLine();\
+                return;\
+            \}\
+            int minBw = parser.nextInt();\
+            int lambda = parser.nextInt();\
+\
+            RouteResult result = findRoute(source, dest, minBw, lambda);\
+            if (!result.found) \{\
+                logBuffer.setLength(0);\
+                logBuffer.append("No route found from ").append(hostIds[source]).append(" to ").append(hostIds[dest]);\
+                writer.append(logBuffer);\
+            \} else \{\
+                logBuffer.setLength(0);\
+                logBuffer.append("Optimal route ").append(hostIds[source]).append(" -> ").append(hostIds[dest])\
+                        .append(": ");\
+\
+                // Zero-Allocation Path Reconstruction\
+                int current = result.endStateIdx;\
+                int pathLen = 0;\
+\
+                // Reuse bestHead as temporary stack? No, risky.\
+                // Use resizing array.\
+                // Assuming pathStack is defined or local.\
+                // Let's define it locally for now,\
+                // but for true zero-alloc we should have a field.\
+                // I will add 'pathStack' field to MatrixNet later or now?\
+                // I can't add field easily with replace.\
+                // I'll make a local large buffer. Max path is hostCount.\
+                // Actually 10k is small.\
+                // But efficient way is to use 'pq.pathBufferA' if accessible.\
+                // 'pq' is private in MatrixNet.\
+                // 'pathBufferA' is inside 'pq' (PrimitiveRouteStateHeap).\
+                // It is 'int[]'.\
+                // I will use 'pathBufferA' from pq to store the path indices.\
+                // Access: pq.pathBufferA\
+\
+                int[] stack = pq.pathBufferA; // Resizing is handled inside pq methods usually\
+                // but here manually.\
+\
+                while (current != -1) \{\
+                    if (pathLen >= stack.length) \{\
+                        // resize\
+                        int[] newStack = new int[stack.length * 2];\
+                        System.arraycopy(stack, 0, newStack, 0, stack.length);\
+                        stack = newStack;\
+                        pq.pathBufferA = stack; // Update ref just in case\
+                    \}\
+                    stack[pathLen++] = pq.poolU[current];\
+                    current = pq.poolPrev[current];\
+                \}\
+\
+                // Path is in stack[pathLen-1 ... 0] (Start to End)\
+                for (int i = pathLen - 1; i >= 0; i--) \{\
+                    if (i < pathLen - 1)\
+                        logBuffer.append(" -> ");\
+                    logBuffer.append(hostIds[stack[i]]);\
+                \}\
+\
+                logBuffer.append(" (Latency = ").append(result.cost).append("ms)");\
+                writer.append(logBuffer);\
+            \}\
+            writer.newLine();\
+        \}\
+\
+        // Multi-objective Dijkstra: minimizes cost (lambda-adjusted latency),\
+        // then hop count, then lexicographical order.\
+        private RouteResult findRoute(int source, int dest, int minBw, int lambda) \{\
+            updateHostRanks();\
+\
+            // Ensure heap capacity based on heuristic (4 states per node avg)\
+            int estimatedStates = Math.max(4096, hostCount * 4);\
+            pq.ensureCapacity(estimatedStates);\
+            pq.reset();\
+\
+            // Resize BestStatePool tracking structures if needed\
+            if (bestHead == null || bestHead.length < hostCount) \{\
+                int cap = Math.max(hostCount, 1024);\
+                bestHead = new int[cap];\
+                for (int i = 0; i < cap; i++)\
+                    bestHead[i] = -1;\
+                bestRunId = new int[cap];\
+            \}\
+            if (bestPool == null) \{\
+                int initialPoolCap = Math.max(100000, hostCount * 4); // Pre-size Pool\
+                bestPool = new BestStatePool(initialPoolCap);\
+            \} else \{\
+                bestPool.reset();\
+            \}\
+\
+            routeSearchId++;\
+\
+            // Initialize start state: source node, 0 cost, 0 edges\
+            int startIdx = pq.allocState(source, 0, 0, -1);\
+\
+            // Lazy initialization of bestHead for current search run\
+            if (bestRunId[source] != routeSearchId) \{\
+                bestHead[source] = -1;\
+                bestRunId[source] = routeSearchId;\
+            \}\
+            // Add (0,0) as the initial best state for source\
+            bestHead[source] = bestPool.alloc(0, 0, startIdx, bestHead[source]);\
+\
+            // Add to Priority Queue\
+            pq.add(startIdx);\
+\
+            int bestCost = Integer.MAX_VALUE;\
+            int bestStateIdx = -1;\
+            // bestPath removed\
+            int bestEdges = Integer.MAX_VALUE;\
+\
+            int maxEdgesForLambda = lambda > 0 ? Integer.MAX_VALUE / lambda : Integer.MAX_VALUE;\
+\
+            while (!pq.isEmpty()) \{\
+                int stateIdx = pq.poll();\
+\
+                int u = pq.poolU[stateIdx];\
+                int cost = pq.poolCost[stateIdx];\
+                int edges = pq.poolEdges[stateIdx];\
+\
+                // Pruning: if current path is strictly worse than best found so far\
+                if (cost > bestCost || (cost == bestCost && edges > bestEdges))\
+                    continue;\
+\
+                boolean dominated = false;\
+                if (bestRunId[u] == routeSearchId) \{\
+                    for (int i = bestHead[u]; i != -1; i = bestPool.next[i]) \{\
+                        int c = bestPool.costs[i];\
+                        int e = bestPool.edges[i];\
+                        // Domination check: if existing state has <= cost AND <= edges\
+                        if (c <= cost && e <= edges) \{\
+                            if (c < cost || e < edges) \{\
+                                // Strictly dominated\
+                                dominated = true;\
+                                break;\
+                            \} else \{\
+                                // Exactly equal (cost, edges). Check if this is the chosen Lex-Best one.\
+                                // If bestPool.stateIndices[i] != stateIdx, it means the pool entry was updated\
+                                // to a BETTER path, or this state is stale.\
+                                if (bestPool.stateIndices[i] != stateIdx) \{\
+                                    dominated = true;\
+                                    break;\
+                                \}\
+                                // If it matches, we process it.\
+                            \}\
+                        \}\
+                    \}\
+                \}\
+                if (dominated)\
+                    continue;\
+\
+                if (u == dest) \{\
+                    if (cost < bestCost) \{\
+                        bestCost = cost;\
+                        bestEdges = edges;\
+                        bestStateIdx = stateIdx;\
+                    \} else \{\
+\
+                        if (edges < bestEdges) \{\
+                            bestEdges = edges; // Found path with fewer hops\
+                            bestStateIdx = stateIdx;\
+                        \} else if (edges == bestEdges) \{\
+                            // Lexicographical tie-break needed (Zero-Allocation)\
+                            if (bestStateIdx == -1) \{\
+                                bestStateIdx = stateIdx;\
+                            \} else \{\
+                                if (pq.compareStatePaths(stateIdx, bestStateIdx) < 0) \{\
+                                    bestStateIdx = stateIdx;\
+                                \}\
+                            \}\
+                        \}\
+                    \}\
+                    continue;\
+                \}\
+\
+                for (int e = head[u]; e != -1; e = next[e]) \{\
+                    if (sealed[e] || bandwidth[e] < minBw)\
+                        continue;\
+                    if (hostClearance[u] < firewall[e])\
+                        continue;\
+\
+                    int lambdaPenalty = 0;\
+                    if (lambda != 0) \{\
+                        if (edges > maxEdgesForLambda)\
+                            continue;\
+                        lambdaPenalty = lambda * edges;\
+                    \}\
+                    if (lambdaPenalty > Integer.MAX_VALUE - latency[e])\
+                        continue;\
+                    int delta = lambdaPenalty + latency[e];\
+                    if (cost > Integer.MAX_VALUE - delta)\
+                        continue;\
+                    int newCost = cost + delta;\
+\
+                    if (newCost > bestCost)\
+                        continue;\
+\
+                    int v = to[e];\
+                    int newEdges = edges + 1;\
+\
+                    // Lazy init for neighbor v\
+                    if (bestRunId[v] != routeSearchId) \{\
+                        bestHead[v] = -1;\
+                        bestRunId[v] = routeSearchId;\
+                    \}\
+\
+                    // Check domination logic\
+                    boolean vDominated = false;\
+                    int equalEntryIdx = -1;\
+\
+                    for (int i = bestHead[v]; i != -1; i = bestPool.next[i]) \{\
+                        int c = bestPool.costs[i];\
+                        int ed = bestPool.edges[i];\
+\
+                        if (c == newCost && ed == newEdges) \{\
+                            equalEntryIdx = i;\
+                            // Found exact match, break to handle lex check\
+                            break;\
+                        \}\
+                        if (c <= newCost && ed <= newEdges) \{\
+                            // Strictly dominated\
+                            vDominated = true;\
+                            break;\
+                        \}\
+                    \}\
+\
+                    if (vDominated)\
+                        continue;\
+\
+                    // Allocate new state tentatively\
+                    int nextStateIdx = pq.allocState(v, newCost, newEdges, stateIdx);\
+\
+                    if (equalEntryIdx != -1) \{\
+                        // Handle tie-breaking with existing Pareto point\
+                        int oldStateIdx = bestPool.stateIndices[equalEntryIdx];\
+                        // If new path is lexicographically smaller, replace old\
+                        if (pq.compareStatePaths(nextStateIdx, oldStateIdx) < 0) \{\
+                            bestPool.stateIndices[equalEntryIdx] = nextStateIdx;\
+                            pq.add(nextStateIdx);\
+                        \}\
+                        continue;\
+                    \}\
+\
+                    // Remove dominated entries from BestStatePool (Standard Pareto update)\
+                    int currentHead = bestHead[v];\
+                    int prev = -1;\
+                    int curr = currentHead;\
+                    while (curr != -1) \{\
+                        int c = bestPool.costs[curr];\
+                        int ed = bestPool.edges[curr];\
+                        int nxt = bestPool.next[curr];\
+\
+                        if (newCost <= c && newEdges <= ed && (newCost < c || newEdges < ed)) \{\
+                            // New state strictly dominates existing one -> remove existing\
+                            if (prev == -1) \{\
+                                bestHead[v] = nxt;\
+                            \} else \{\
+                                bestPool.next[prev] = nxt;\
+                            \}\
+                            curr = nxt;\
+                        \} else \{\
+                            prev = curr;\
+                            curr = nxt;\
+                        \}\
+                    \}\
+\
+                    // Log new Pareto state\
+                    bestHead[v] = bestPool.alloc(newCost, newEdges, nextStateIdx, bestHead[v]);\
+                    pq.add(nextStateIdx);\
+                \}\
+            \}\
+\
+            if (bestStateIdx == -1)\
+                return RouteResult.notFound();\
+            return new RouteResult(true, bestCost, bestStateIdx);\
+        \}\
+\
+        private void handleScanConnectivity(BufferedWriter writer) throws IOException \{\
+            if (hostCount <= 1) \{\
+                writer.write("Network is fully connected.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int components = getComponentCount();\
+\
+            if (components == 1) \{\
+                writer.write("Network is fully connected.");\
+            \} else \{\
+                logBuffer.setLength(0);\
+                logBuffer.append("Network has ").append(components).append(" disconnected components.");\
+                writer.append(logBuffer);\
+            \}\
+            writer.newLine();\
+        \}\
+\
+        private void handleSimulateBreach(BufferedWriter writer) throws IOException \{\
+            if (!parser.nextToken()) \{\
+                writer.write("Some error occurred in simulate_breach.");\
+                writer.newLine();\
+                return;\
+            \}\
+            int a = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+\
+            boolean hasArg2 = parser.nextToken();\
+\
+            if (!hasArg2) \{\
+                if (a == -1) \{\
+                    writer.write("Some error occurred in simulate_breach.");\
+                    writer.newLine();\
+                    return;\
+                \}\
+                // Tarjan Optimization: O(1) query\
+                precomputeCriticalities();\
+                int originalComponents = getGraphInfo().components;\
+                int componentsAfter = originalComponents;\
+\
+                // If removing host 'a':\
+                // Delta = apComponentIncrease[a].\
+                // But we must account for 'a' itself disappearing (minus 1 component if it was\
+                // isolated or leaf).\
+                // Actually easier: apComponentIncrease[a] is "Increase".\
+                // Result = Original + Increase.\
+                // UNLESS 'a' was an isolated component of size 1.\
+                // If Size(Comp(a)) == 1, removing 'a' reduces component count by 1.\
+                // apComponentIncrease[a] would be 0 for root with 0 children.\
+                // Formula: Original + 0 = Original. Wrong.\
+                // We need to check if 'a' has any unsealed edges.\
+                boolean isIsolated = true;\
+                for (int ex = head[a]; ex != -1; ex = next[ex]) \{\
+                    if (!sealed[ex]) \{\
+                        isIsolated = false;\
+                        break;\
+                    \}\
+                \}\
+\
+                if (isIsolated) \{\
+                    componentsAfter = originalComponents - 1;\
+                \} else \{\
+                    componentsAfter = originalComponents + apComponentIncrease[a];\
+                \}\
+\
+                if (componentsAfter > originalComponents) \{\
+                    logBuffer.setLength(0);\
+                    logBuffer.append("Host ").append(hostIds[a]).append(" IS an articulation point.");\
+                    writer.append(logBuffer);\
+                    writer.newLine();\
+                    logBuffer.setLength(0);\
+                    logBuffer.append("Failure results in ").append(componentsAfter).append(" disconnected components.");\
+                    writer.append(logBuffer);\
+                \} else \{\
+                    logBuffer.setLength(0);\
+                    logBuffer.append("Host ").append(hostIds[a])\
+                            .append(" is NOT an articulation point. Network remains the same.");\
+                    writer.append(logBuffer);\
+                \}\
+                writer.newLine();\
+                return;\
+            \}\
+\
+            int b = hostMap.get(parser.line, parser.tokenStart, parser.tokenLen);\
+            if (a == -1 || b == -1) \{\
+                writer.write("Some error occurred in simulate_breach.");\
+                writer.newLine();\
+                return;\
+            \}\
+            long key = connectionKey(a, b);\
+            int e = connectionMap.get(key);\
+            if (e == -1 || sealed[e]) \{\
+                writer.write("Some error occurred in simulate_breach.");\
+                writer.newLine();\
+                return;\
+            \} else \{\
+                // Edge failure a-b\
+                // b, key, e already declared above\
+\
+                // Tarjan Optimization: O(1) query\
+                precomputeCriticalities();\
+                int originalComponents = getGraphInfo().components;\
+\
+                int componentsAfter;\
+\
+                boolean bridge = isBridge[e];\
+                componentsAfter = originalComponents + (bridge ? 1 : 0);\
+\
+                if (bridge) \{\
+                    logBuffer.setLength(0);\
+                    logBuffer.append("Backdoor ").append(hostIds[a]).append(" <-> ").append(hostIds[b])\
+                            .append(" IS a bridge.");\
+                    writer.append(logBuffer);\
+                    writer.newLine();\
+                    logBuffer.setLength(0);\
+                    logBuffer.append("Failure results in ").append(componentsAfter).append(" disconnected components.");\
+                    writer.append(logBuffer);\
+                \} else \{\
+                    logBuffer.setLength(0);\
+                    logBuffer.append("Backdoor ").append(hostIds[a]).append(" <-> ").append(hostIds[b])\
+                            .append(" is NOT a bridge. Network remains the same.");\
+                    writer.append(logBuffer);\
+                \}\
+                writer.newLine();\
+            \}\
+        \}\
+\
+        private void handleOracleReport(BufferedWriter writer) throws IOException \{\
+            GraphInfo info = getGraphInfo();\
+            writer.write("--- Resistance Network Report ---");\
+            writer.newLine();\
+            logBuffer.setLength(0);\
+            logBuffer.append("Total Hosts: ").append(hostCount);\
+            writer.append(logBuffer);\
+            writer.newLine();\
+            logBuffer.setLength(0);\
+            logBuffer.append("Total Unsealed Backdoors: ").append(unsealedBackdoorCount);\
+            writer.append(logBuffer);\
+            writer.newLine();\
+            boolean connected = hostCount <= 1 || info.components == 1;\
+            writer.write("Network Connectivity: " + (connected ? "Connected" : "Disconnected"));\
+            writer.newLine();\
+            logBuffer.setLength(0);\
+            logBuffer.append("Connected Components: ").append(info.components);\
+            writer.append(logBuffer);\
+            writer.newLine();\
+            writer.write("Contains Cycles: " + (info.hasCycle ? "Yes" : "No"));\
+            writer.newLine();\
+            logBuffer.setLength(0);\
+            logBuffer.append("Average Bandwidth: ").append(formatAverage(unsealedBandwidthSum, unsealedBackdoorCount))\
+                    .append("Mbps");\
+            writer.append(logBuffer);\
+            writer.newLine();\
+            logBuffer.setLength(0);\
+            logBuffer.append("Average Clearance Level: ").append(formatAverage(totalClearance, hostCount));\
+            writer.append(logBuffer);\
+            writer.newLine();\
+        \}\
+\
+        // Formats the average value to 1 decimal place using strict BigDecimal rounding\
+        // (HALF_UP)\
+\
+        private String formatAverage(long sum, int count) \{\
+            if (count == 0)\
+                return "0.0";\
+            // Use Integer-based construction for exact precision, avoiding double\
+            // representation errors\
+            return java.math.BigDecimal.valueOf(sum)\
+                    .divide(java.math.BigDecimal.valueOf(count), 1, java.math.RoundingMode.HALF_UP)\
+                    .toString();\
+        \}\
+\
+        // Precomputes Articulation Points and Bridges using Iterative Tarjan's\
+        // Algorithm.\
+        private void precomputeCriticalities() \{\
+            if (!criticalitiesDirty)\
+                return;\
+\
+            int n = hostCount;\
+            int estimatedStackSize = n * 2;\
+\
+            // Adjust capacity logic to pre-size\
+            if (disc == null || disc.length < n) \{\
+                int cap = Math.max(n, INITIAL_HOST_CAP);\
+                disc = new int[cap];\
+                low = new int[cap];\
+                apComponentIncrease = new int[cap];\
+                tarjanStack = new int[cap * 4];\
+                childCount = new int[cap];\
+                visitedToken = new int[cap];\
+            \}\
+            if (tarjanStack.length < estimatedStackSize * 3) \{\
+                tarjanStack = new int[estimatedStackSize * 3];\
+            \}\
+\
+            if (isBridge == null || isBridge.length < edgeCount) \{\
+                isBridge = new boolean[Math.max(edgeCount, INITIAL_EDGE_CAP)];\
+            \}\
+\
+            // Token Management\
+            globalToken++;\
+            if (globalToken == 0) \{ // Overflow wrap-around (very rare)\
+                globalToken = 1;\
+                java.util.Arrays.fill(visitedToken, 0); // Clear all if wrapped\
+            \}\
+\
+            // Reset critical arrays for bridges?\
+            // Bridges are persistent properties.\
+            // We must clear isBridge if graph changed.\
+            // Since we don't have bridgeToken, we still do this.\
+            // But only for current edges.\
+            for (int i = 0; i < edgeCount; i++)\
+                isBridge[i] = false;\
+\
+            time = 0;\
+            int componentCount = 0;\
+            boolean hasCycle = false;\
+\
+            // Iterative DFS stack\
+            // Frames: [u, edge_ptr, parentEdge]\
+            // parentEdge is the edge index used to arrive at u from parent. -1 for root.\
+            int[] stack = tarjanStack;\
+            int top = 0;\
+\
+            for (int i = 0; i < n; i++) \{\
+                // If visited in current run, skip\
+                if (visitedToken[i] == globalToken)\
+                    continue;\
+\
+                componentCount++;\
+                // Push root 'i'\
+                stack[top++] = i;\
+                stack[top++] = head[i];\
+                stack[top++] = -1;\
+\
+                // Initialize root AP count (needed since array is dirty from prev runs)\
+                // Actually we just write to it at the end.\
+                // But safety init:\
+                apComponentIncrease[i] = 0;\
+\
+                while (top > 0) \{\
+                    int pe = stack[top - 1]; // parentEdge\
+                    int e = stack[top - 2]; // current edge ptr\
+                    int u = stack[top - 3]; // current node\
+\
+                    if (visitedToken[u] != globalToken) \{\
+                        visitedToken[u] = globalToken;\
+                        disc[u] = low[u] = ++time;\
+                        childCount[u] = 0;\
+                        apComponentIncrease[u] = 0; // Clear dirty value\
+                    \}\
+\
+                    int p = (pe == -1) ? -1 : to[edgePartner[pe]];\
+\
+                    boolean pushedChild = false;\
+                    while (e != -1) \{\
+                        if (sealed[e]) \{\
+                            e = next[e];\
+                            continue;\
+                        \}\
+\
+                        // Multigraph handling:\
+                        // Only ignore the exact edge we came from (reverse of pe).\
+                        if (pe != -1 && e == edgePartner[pe]) \{\
+                            e = next[e];\
+                            continue;\
+                        \}\
+\
+                        int v = to[e];\
+                        if (visitedToken[v] == globalToken) \{\
+                            // Back-edge (or parallel edge to parent) -> Cycle detected\
+                            // Only if v is in stack (ancestor). In standard Tarjan undirected,\
+                            // if v is visited and not parent, it's a back edge.\
+                            // With bridges, disc[v] < disc[u] check is implied if visited.\
+                            hasCycle = true;\
+                            low[u] = Math.min(low[u], disc[v]);\
+                            e = next[e];\
+                        \} else \{\
+                            // Tree-edge to v\
+                            stack[top - 2] = next[e]; // Save state of u\
+\
+                            // Push v with 'e' as parentEdge\
+                            stack[top++] = v;\
+                            stack[top++] = head[v];\
+                            stack[top++] = e;\
+                            pushedChild = true;\
+                            break;\
+                        \}\
+                    \}\
+\
+                    if (!pushedChild) \{\
+                        // Finished u, backtrack\
+                        top -= 3; // Pop u\
+\
+                        if (p != -1) \{\
+                            // Returning to parent p from child u\
+                            low[p] = Math.min(low[p], low[u]);\
+                            childCount[p]++;\
+\
+                            // AP Check (Non-root)\
+                            if (low[u] >= disc[p]) \{\
+                                apComponentIncrease[p]++;\
+                            \}\
+\
+                            // Bridge Check\
+                            if (low[u] > disc[p]) \{\
+                                // The edge we came from (pe) IS a bridge.\
+                                isBridge[pe] = true;\
+                                isBridge[edgePartner[pe]] = true;\
+                            \}\
+                        \}\
+                    \}\
+                \}\
+\
+                // Root check\
+                if (childCount[i] > 1) \{\
+                    apComponentIncrease[i] = childCount[i] - 1;\
+                \} else \{\
+                    apComponentIncrease[i] = 0;\
+                \}\
+            \}\
+            criticalitiesDirty = false;\
+\
+            // Optimization: Update cachedGraphInfo avoiding redundant analyzeGraph() call\
+            if (cachedGraphInfo == null)\
+                cachedGraphInfo = new GraphInfo();\
+            cachedGraphInfo.components = componentCount;\
+            cachedGraphInfo.hasCycle = hasCycle;\
+        \}\
+\
+        private int getComponentCount() \{\
+            return getGraphInfo().components;\
+        \}\
+\
+        private GraphInfo getGraphInfo() \{\
+            if (graphInfoDirty) \{\
+                // Tarjan computes everything (Components, Cycles).\
+                // It updates cachedGraphInfo.\
+                precomputeCriticalities();\
+\
+                // If precompute didn't run because it thought criticalities weren't dirty,\
+                // but graphInfo IS dirty (shouldn't happen if dirty logic is synced),\
+                // we force it.\
+                if (cachedGraphInfo == null) \{\
+                    criticalitiesDirty = true;\
+                    precomputeCriticalities();\
+                \}\
+                // Just in case precompute didn't clear graphInfoDirty (it should have):\
+                graphInfoDirty = false;\
+            \}\
+            return cachedGraphInfo;\
+        \}\
+\
+        private void markGraphDirty() \{\
+            graphInfoDirty = true;\
+            criticalitiesDirty = true;\
+        \}\
+\
+        private void ensureHostCapacity(int capacity) \{\
+            if (capacity > hostIds.length) \{\
+                int newCap = Math.max(hostIds.length * 2, capacity);\
+                if (newCap < INITIAL_HOST_CAP)\
+                    newCap = INITIAL_HOST_CAP; // respect min size\
+                String[] newHostIds = new String[newCap];\
+                System.arraycopy(hostIds, 0, newHostIds, 0, hostIds.length);\
+                hostIds = newHostIds;\
+\
+                int[] newHostClearance = new int[newCap];\
+                System.arraycopy(hostClearance, 0, newHostClearance, 0, hostClearance.length);\
+                hostClearance = newHostClearance;\
+\
+                int[] newHead = new int[newCap];\
+                System.arraycopy(head, 0, newHead, 0, head.length);\
+\
+                for (int i = head.length; i < newCap; i++)\
+                    newHead[i] = -1;\
+                head = newHead;\
+            \}\
+        \}\
+\
+        private void ensureEdgeCapacity(int capacity) \{\
+            if (capacity > next.length) \{\
+                int newCap = Math.max(next.length * 2, capacity);\
+                if (newCap < INITIAL_EDGE_CAP)\
+                    newCap = INITIAL_EDGE_CAP;\
+                int[] newNext = new int[newCap];\
+                System.arraycopy(next, 0, newNext, 0, next.length);\
+                next = newNext;\
+                int[] newTo = new int[newCap];\
+                System.arraycopy(to, 0, newTo, 0, to.length);\
+                to = newTo;\
+                int[] newLatency = new int[newCap];\
+                System.arraycopy(latency, 0, newLatency, 0, latency.length);\
+                latency = newLatency;\
+                int[] newBandwidth = new int[newCap];\
+                System.arraycopy(bandwidth, 0, newBandwidth, 0, bandwidth.length);\
+                bandwidth = newBandwidth;\
+                int[] newFirewall = new int[newCap];\
+                System.arraycopy(firewall, 0, newFirewall, 0, firewall.length);\
+                firewall = newFirewall;\
+                boolean[] newSealed = new boolean[newCap];\
+                System.arraycopy(sealed, 0, newSealed, 0, sealed.length);\
+                sealed = newSealed;\
+                int[] newEdgePartner = new int[newCap];\
+                System.arraycopy(edgePartner, 0, newEdgePartner, 0, edgePartner.length);\
+                edgePartner = newEdgePartner;\
+            \}\
+        \}\
+\
+        private static long connectionKey(int a, int b) \{\
+            if (a < b)\
+                return (((long) a) << 32) ^ b;\
+            return (((long) b) << 32) ^ a;\
+        \}\
+\
+        private boolean isValidHostId(String id) \{\
+            if (id == null || id.isEmpty())\
+                return false;\
+            int len = id.length();\
+            for (int i = 0; i < len; i++) \{\
+                char c = id.charAt(i);\
+                if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))\
+                    return false;\
+            \}\
+            return true;\
+        \}\
+\
+        private static class GraphInfo \{\
+            int components = 0;\
+            boolean hasCycle = false;\
+        \}\
+\
+        private record RouteResult(boolean found, int cost, int endStateIdx) \{\
+            static RouteResult notFound() \{\
+                return new RouteResult(false, 0, -1);\
+            \}\
+        \}\
+\
+        // Pool for storing the Pareto frontier of best states for each node.\
+        // Each node maintains a linked list of non-dominated (Cost, Edges) pairs.\
+        private static class BestStatePool \{\
+            int[] costs; // Optimized to int (Max cost ~100M < 2B)\
+            int[] edges;\
+            int[] stateIndices; // Store the PQ state index for this Pareto point\
+            int[] next;\
+            int ptr = 0;\
+\
+            BestStatePool(int initialCap) \{\
+                costs = new int[initialCap];\
+                edges = new int[initialCap];\
+                stateIndices = new int[initialCap];\
+                next = new int[initialCap];\
+            \}\
+\
+            int alloc(int cost, int edge, int stateIdx, int nextIdx) \{\
+                if (ptr >= costs.length)\
+                    resize();\
+                int idx = ptr++;\
+                costs[idx] = cost;\
+                edges[idx] = edge;\
+                stateIndices[idx] = stateIdx;\
+                next[idx] = nextIdx;\
+                return idx;\
+            \}\
+\
+            void reset() \{\
+                ptr = 0;\
+            \}\
+\
+            private void resize() \{\
+                int newCap = costs.length * 2;\
+                int[] newCosts = new int[newCap];\
+                System.arraycopy(costs, 0, newCosts, 0, costs.length);\
+                costs = newCosts;\
+                int[] newEdges = new int[newCap];\
+                System.arraycopy(edges, 0, newEdges, 0, edges.length);\
+                edges = newEdges;\
+                int[] newStateIndices = new int[newCap];\
+                System.arraycopy(stateIndices, 0, newStateIndices, 0, stateIndices.length);\
+                stateIndices = newStateIndices;\
+                int[] newNext = new int[newCap];\
+                System.arraycopy(next, 0, newNext, 0, next.length);\
+                next = newNext;\
+            \}\
+        \}\
+\
+        // Custom RouteStateHeap using primitive arrays to avoid object overhead.\
+        // Acts as a Priority Queue for Dijkstra states.\
+        private class PrimitiveRouteStateHeap \{\
+            int[] heap; // Stores indices into the 'pool' arrays\
+            int size = 0;\
+\
+            // Pool arrays to store state data (U, Cost, Edges, PrevState)\
+            // This pooling mechanism drastically reduces GC pressure.\
+            int[] poolU;\
+            int[] poolCost; // Optimized to int\
+            int[] poolEdges;\
+            int[] poolPrev;\
+            int poolPtr = 0;\
+\
+            int[] pathBufferA = new int[1024];\
+            int[] pathBufferB = new int[1024];\
+\
+            PrimitiveRouteStateHeap() \{\
+                int initCap = 4096;\
+                poolU = new int[initCap];\
+                poolCost = new int[initCap];\
+                poolEdges = new int[initCap];\
+                poolPrev = new int[initCap];\
+                heap = new int[2048];\
+            \}\
+\
+            void ensureCapacity(int needed) \{\
+                if (poolU.length < needed) \{\
+                    int newCap = Math.max(poolU.length * 2, needed);\
+                    resizePool(newCap);\
+                \}\
+                if (heap.length < needed) \{\
+                    int newCap = Math.max(heap.length * 2, needed);\
+                    resizeHeap(newCap);\
+                \}\
+            \}\
+\
+            private void resizePool(int newCap) \{\
+                int[] nu = new int[newCap];\
+                System.arraycopy(poolU, 0, nu, 0, poolU.length);\
+                poolU = nu;\
+                int[] nc = new int[newCap];\
+                System.arraycopy(poolCost, 0, nc, 0, poolCost.length);\
+                poolCost = nc;\
+                int[] ne = new int[newCap];\
+                System.arraycopy(poolEdges, 0, ne, 0, poolEdges.length);\
+                poolEdges = ne;\
+                int[] np = new int[newCap];\
+                System.arraycopy(poolPrev, 0, np, 0, poolPrev.length);\
+                poolPrev = np;\
+            \}\
+\
+            private void resizeHeap(int newCap) \{\
+                int[] nh = new int[newCap];\
+                System.arraycopy(heap, 0, nh, 0, heap.length);\
+                heap = nh;\
+            \}\
+\
+            int allocState(int u, int cost, int edges, int prev) \{\
+                if (poolPtr >= poolU.length) \{\
+                    resizePool(poolU.length * 2);\
+                \}\
+                int idx = poolPtr++;\
+                poolU[idx] = u;\
+                poolCost[idx] = cost;\
+                poolEdges[idx] = edges;\
+                poolPrev[idx] = prev;\
+                return idx;\
+            \}\
+\
+            void add(int stateIdx) \{\
+                if (size >= heap.length) \{\
+                    resizeHeap(heap.length * 2);\
+                \}\
+                heap[size] = stateIdx;\
+                siftUp(size);\
+                size++;\
+            \}\
+\
+            int poll() \{\
+                if (size == 0)\
+                    return -1;\
+                int ret = heap[0];\
+                size--;\
+                if (size > 0) \{\
+                    heap[0] = heap[size];\
+                    siftDown(0);\
+                \}\
+                heap[size] = -1;\
+                return ret;\
+            \}\
+\
+            boolean isEmpty() \{\
+                return size == 0;\
+            \}\
+\
+            void siftUp(int k) \{\
+                int idx = heap[k];\
+                int cost = poolCost[idx];\
+                int edges = poolEdges[idx];\
+\
+                while (k > 0) \{\
+                    int p = (k - 1) >>> 1;\
+                    int pIdx = heap[p];\
+                    int pCost = poolCost[pIdx];\
+\
+                    if (cost < pCost) \{\
+                        heap[k] = pIdx;\
+                        k = p;\
+                    \} else if (cost > pCost) \{\
+                        break;\
+                    \} else \{ // cost == pCost\
+                        int pEdges = poolEdges[pIdx];\
+                        if (edges < pEdges) \{\
+                            heap[k] = pIdx;\
+                            k = p;\
+                        \} else \{\
+                            // Deterministic tie-breaking using Host Rank\
+                            if (hostRank[poolU[idx]] < hostRank[poolU[pIdx]]) \{\
+                                heap[k] = pIdx;\
+                                k = p;\
+                            \} else \{\
+                                break;\
+                            \}\
+                        \}\
+                    \}\
+                \}\
+                heap[k] = idx;\
+            \}\
+\
+            void siftDown(int k) \{\
+                int idx = heap[k];\
+                int cost = poolCost[idx];\
+                int edges = poolEdges[idx];\
+                int half = size >>> 1;\
+\
+                while (k < half) \{\
+                    int child = (k << 1) + 1;\
+                    int cIdx = heap[child];\
+                    int cCost = poolCost[cIdx];\
+                    int cEdges = poolEdges[cIdx];\
+\
+                    int right = child + 1;\
+                    if (right < size) \{\
+                        int rIdx = heap[right];\
+                        int rCost = poolCost[rIdx];\
+                        int rEdges = poolEdges[rIdx];\
+\
+                        if (rCost < cCost) \{\
+                            child = right;\
+                            cIdx = rIdx;\
+                            cCost = rCost;\
+                            cEdges = rEdges;\
+                        \} else if (rCost == cCost) \{\
+                            if (rEdges < cEdges) \{\
+                                child = right;\
+                                cIdx = rIdx;\
+                                cCost = rCost;\
+                                cEdges = rEdges;\
+                            \} else if (rEdges == cEdges) \{\
+                                if (hostRank[poolU[rIdx]] < hostRank[poolU[cIdx]]) \{\
+                                    child = right;\
+                                    cIdx = rIdx;\
+                                    cCost = rCost;\
+                                    cEdges = rEdges;\
+                                \}\
+                            \}\
+                        \}\
+                    \}\
+\
+                    if (cost < cCost)\
+                        break;\
+                    if (cost == cCost && edges < cEdges)\
+                        break;\
+                    if (cost == cCost && edges == cEdges && hostRank[poolU[idx]] <= hostRank[poolU[cIdx]])\
+                        break;\
+\
+                    heap[k] = cIdx;\
+                    k = child;\
+                \}\
+                heap[k] = idx;\
+            \}\
+\
+            void reset() \{\
+                size = 0;\
+                poolPtr = 0;\
+            \}\
+\
+            // Zero-Allocation Lexicographical Comparison\
+            int compareStatePaths(int stateIdxA, int stateIdxB) \{\
+                int lenA = 0;\
+                int cur = stateIdxA;\
+                while (cur != -1) \{\
+                    if (lenA >= pathBufferA.length) \{\
+                        pathBufferA = resizeBuffer(pathBufferA);\
+                    \}\
+                    pathBufferA[lenA++] = poolU[cur];\
+                    cur = poolPrev[cur];\
+                \}\
+\
+                int lenB = 0;\
+                cur = stateIdxB;\
+                while (cur != -1) \{\
+                    if (lenB >= pathBufferB.length) \{\
+                        pathBufferB = resizeBuffer(pathBufferB);\
+                    \}\
+                    pathBufferB[lenB++] = poolU[cur];\
+                    cur = poolPrev[cur];\
+                \}\
+\
+                // Reverse compare (Root -> Leaf)\
+                // pathBuffer contains [Leaf, ..., Root]\
+                int i = lenA - 1;\
+                int j = lenB - 1;\
+                while (i >= 0 && j >= 0) \{\
+                    int uA = pathBufferA[i];\
+                    int uB = pathBufferB[j];\
+                    if (uA != uB) \{\
+                        // hostRank available because inner class\
+                        return Integer.compare(hostRank[uA], hostRank[uB]);\
+                    \}\
+                    i--;\
+                    j--;\
+                \}\
+                return Integer.compare(lenA, lenB);\
+            \}\
+\
+            private int[] resizeBuffer(int[] oldBuf) \{\
+                int[] newBuf = new int[oldBuf.length * 2];\
+                System.arraycopy(oldBuf, 0, newBuf, 0, oldBuf.length);\
+                return newBuf;\
+            \}\
+        \}\
+\
+        private void updateHostRanks() \{\
+            if (!hostsDirtyRanks)\
+                return;\
+            int[] indices = new int[hostCount];\
+            for (int i = 0; i < hostCount; i++)\
+                indices[i] = i;\
+\
+            quickSortIndices(indices, 0, hostCount - 1);\
+\
+            if (hostRank == null || hostRank.length < hostCount) \{\
+                hostRank = new int[Math.max(hostCount, hostIds.length)];\
+            \}\
+            for (int i = 0; i < hostCount; i++) \{\
+                hostRank[indices[i]] = i;\
+            \}\
+            hostsDirtyRanks = false;\
+        \}\
+\
+        // Specialized QuickSort for host integers.\
+        // Sorts 'indices' array based on the String IDs in 'hostIds'.\
+        // Avoids Boxing/Unboxing of Integer objects.\
+        private void quickSortIndices(int[] indices, int low, int high) \{\
+            if (low < high) \{\
+                int pi = partitionIndices(indices, low, high);\
+                quickSortIndices(indices, low, pi - 1);\
+                quickSortIndices(indices, pi + 1, high);\
+            \}\
+        \}\
+\
+        private int partitionIndices(int[] indices, int low, int high) \{\
+            // Use Middle Element as pivot to handle sorted inputs efficiently\
+            // without the overhead of Math.random() initialization\
+            int pivotIndex = (low + high) >>> 1;\
+\
+            // Swap pivot to end\
+            int tempP = indices[pivotIndex];\
+            indices[pivotIndex] = indices[high];\
+            indices[high] = tempP;\
+\
+            String pivot = hostIds[indices[high]];\
+            int i = (low - 1);\
+            for (int j = low; j < high; j++) \{\
+                if (hostIds[indices[j]].compareTo(pivot) < 0) \{\
+                    i++;\
+                    int temp = indices[i];\
+                    indices[i] = indices[j];\
+                    indices[j] = temp;\
+                \}\
+            \}\
+            int temp = indices[i + 1];\
+            indices[i + 1] = indices[high];\
+            indices[high] = temp;\
+            return i + 1;\
+        \}\
+\
+        private static class HostMap \{\
+            private static final int INITIAL_CAPACITY = 2048;\
+            private static final float LOAD_FACTOR = 0.75f;\
+            private Entry[] table;\
+            private int size;\
+            private int threshold;\
+\
+            HostMap() \{\
+                table = new Entry[INITIAL_CAPACITY];\
+                threshold = (int) (INITIAL_CAPACITY * LOAD_FACTOR);\
+            \}\
+\
+            void put(String key, int value) \{\
+                if (size >= threshold)\
+                    resize();\
+                int h = key.hashCode();\
+                h = h ^ (h >>> 16);\
+                int index = (h & 0x7FFFFFFF) % table.length;\
+                Entry head = table[index];\
+                Entry current = head;\
+                while (current != null) \{\
+                    if (current.key.equals(key))\
+                        return;\
+                    current = current.next;\
+                \}\
+                table[index] = new Entry(key, value, head);\
+                size++;\
+            \}\
+\
+            int get(String key) \{\
+                int h = key.hashCode();\
+                h = h ^ (h >>> 16);\
+                int index = (h & 0x7FFFFFFF) % table.length;\
+                Entry current = table[index];\
+                while (current != null) \{\
+                    if (current.key.equals(key))\
+                        return current.value;\
+                    current = current.next;\
+                \}\
+                return -1;\
+            \}\
+\
+            // Zero-allocation lookup using char array/buffer\
+            // Simulates key.hashCode() and equals() without creating String\
+            int get(String buffer, int start, int len) \{\
+                int h = 0;\
+                for (int i = 0; i < len; i++) \{\
+                    h = 31 * h + buffer.charAt(start + i);\
+                \}\
+                h = h ^ (h >>> 16);\
+                int index = (h & 0x7FFFFFFF) % table.length;\
+                Entry current = table[index];\
+                while (current != null) \{\
+                    // Check length first\
+                    if (current.key.length() == len) \{\
+                        // Compare chars\
+                        boolean match = true;\
+                        for (int i = 0; i < len; i++) \{\
+                            if (current.key.charAt(i) != buffer.charAt(start + i)) \{\
+                                match = false;\
+                                break;\
+                            \}\
+                        \}\
+                        if (match)\
+                            return current.value;\
+                    \}\
+                    current = current.next;\
+                \}\
+                return -1;\
+            \}\
+\
+            boolean contains(String key) \{\
+                return get(key) != -1;\
+            \}\
+\
+            private void resize() \{\
+                int newCap = table.length * 2;\
+                Entry[] newTable = new Entry[newCap];\
+                for (Entry e : table) \{\
+                    while (e != null) \{\
+                        Entry next = e.next;\
+                        int h = e.key.hashCode();\
+                        h = h ^ (h >>> 16);\
+                        int index = (h & 0x7FFFFFFF) % newCap;\
+                        e.next = newTable[index];\
+                        newTable[index] = e;\
+                        e = next;\
+                    \}\
+                \}\
+                table = newTable;\
+                threshold = (int) (newCap * LOAD_FACTOR);\
+            \}\
+\
+            static class Entry \{\
+                final String key;\
+                final int value;\
+                Entry next;\
+\
+                Entry(String key, int value, Entry next) \{\
+                    this.key = key;\
+                    this.value = value;\
+                    this.next = next;\
+                \}\
+            \}\
+        \}\
+\
+        private static class ConnectionMap \{\
+            private static final int INITIAL_CAPACITY = 2048;\
+            private static final float LOAD_FACTOR = 0.75f;\
+            private ConnEntry[] table;\
+            private int size;\
+            private int threshold;\
+\
+            ConnectionMap() \{\
+                table = new ConnEntry[INITIAL_CAPACITY];\
+                threshold = (int) (INITIAL_CAPACITY * LOAD_FACTOR);\
+            \}\
+\
+            void put(long key, int value) \{\
+                if (size >= threshold)\
+                    resize();\
+                int h = Long.hashCode(key);\
+                h = h ^ (h >>> 16);\
+                int index = (h & 0x7FFFFFFF) % table.length;\
+                ConnEntry head = table[index];\
+                ConnEntry current = head;\
+                while (current != null) \{\
+                    if (current.key == key)\
+                        return;\
+                    current = current.next;\
+                \}\
+                table[index] = new ConnEntry(key, value, head);\
+                size++;\
+            \}\
+\
+            int get(long key) \{\
+                int h = Long.hashCode(key);\
+                h = h ^ (h >>> 16);\
+                int index = (h & 0x7FFFFFFF) % table.length;\
+                ConnEntry current = table[index];\
+                while (current != null) \{\
+                    if (current.key == key)\
+                        return current.value;\
+                    current = current.next;\
+                \}\
+                return -1;\
+            \}\
+\
+            boolean contains(long key) \{\
+                return get(key) != -1;\
+            \}\
+\
+            private void resize() \{\
+                int newCap = table.length * 2;\
+                ConnEntry[] newTable = new ConnEntry[newCap];\
+                for (ConnEntry e : table) \{\
+                    while (e != null) \{\
+                        ConnEntry next = e.next;\
+                        int h = Long.hashCode(e.key);\
+                        h = h ^ (h >>> 16);\
+                        int index = (h & 0x7FFFFFFF) % newCap;\
+                        e.next = newTable[index];\
+                        newTable[index] = e;\
+                        e = next;\
+                    \}\
+                \}\
+                table = newTable;\
+                threshold = (int) (newCap * LOAD_FACTOR);\
+            \}\
+\
+            static class ConnEntry \{\
+                final long key;\
+                final int value;\
+                ConnEntry next;\
+\
+                ConnEntry(long key, int value, ConnEntry next) \{\
+                    this.key = key;\
+                    this.value = value;\
+                    this.next = next;\
+                \}\
+            \}\
+        \}\
+\
+        // Helper class for parsing input lines without String.split()\
+        // Reduces temporary String allocation.\
+        private static class LineParser \{\
+            String line;\
+            int pos;\
+            int len;\
+            int tokenStart;\
+            int tokenLen;\
+\
+            void reset(String l) \{\
+                line = l;\
+                pos = 0;\
+                len = l.length();\
+            \}\
+\
+            boolean nextToken() \{\
+                skipWhitespace();\
+                if (pos >= len)\
+                    return false;\
+                tokenStart = pos;\
+                while (pos < len && line.charAt(pos) > ' ')\
+                    pos++;\
+                tokenLen = pos - tokenStart;\
+                return true;\
+            \}\
+\
+            String nextString() \{\
+                if (!nextToken())\
+                    return null;\
+                return line.substring(tokenStart, tokenStart + tokenLen);\
+            \}\
+\
+            int nextInt() \{\
+                skipWhitespace();\
+                if (pos >= len)\
+                    return 0;\
+                int val = 0;\
+                while (pos < len) \{\
+                    char c = line.charAt(pos);\
+                    if (c <= ' ')\
+                        break;\
+                    val = val * 10 + (c - '0');\
+                    pos++;\
+                \}\
+                return val;\
+            \}\
+\
+            void skipWhitespace() \{\
+                while (pos < len && line.charAt(pos) <= ' ')\
+                    pos++;\
+            \}\
+\
+            // Checks if the next token matches 'expected' without allocating a String.\
+            // If it matches, consumes the token and returns true.\
+            // If not, resets position (or doesn't advance) and returns false?\
+            // Actually simpler: peek. If match, consume.\
+            // But strict command parsing usually consumes.\
+            boolean isCommand(String expected) \{\
+                skipWhitespace();\
+                int start = pos;\
+                int expLen = expected.length();\
+                if (start + expLen > len)\
+                    return false;\
+\
+                for (int i = 0; i < expLen; i++) \{\
+                    if (line.charAt(start + i) != expected.charAt(i)) \{\
+                        return false;\
+                    \}\
+                \}\
+                // Check if followed by delimiter or end of line\
+                if (start + expLen < len && line.charAt(start + expLen) > ' ') \{\
+                    return false; // Partial match e.g. "spawn_host_extra"\
+                \}\
+\
+                pos += expLen;\
+                return true;\
+            \}\
+        \}\
+    \}\
+\}\
+\
+}
