@@ -65,4 +65,11 @@ The project includes a multi-approach testing suite:
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
 
 ---
+### 🔗 The Algorithmic Excellence Series
+*Looking for more high-performance implementations?*
+- **[Spireslayer](https://github.com/yigitsarpavci/Spireslayer-Command-Interpreter)**: C-based Systems Programming & CLI Design.
+- **[GigMatch-Pro](https://github.com/yigitsarpavci/GigMatch-Pro)**: Priority Queue Matching Algorithms.
+- **[Nightpass](https://github.com/yigitsarpavci/Nightpass-A-Survival-Card-Game)**: State-Machine Survival Mechanics.
+
+---
 *Developed with ❤️ by Yiğit Sarp Avcı*
